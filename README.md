@@ -1,6 +1,6 @@
 # myAI — E-commerce Requirements and SDLC Assistant
 
-`myAI` is a local-first Mastra application modeled after [SAI](https://github.com/Master9Wayne/SAI). It uses Qwen 3.5 through an OpenAI-compatible LM Studio server, retrieves evidence from the verified e-commerce SDLC dataset, and runs two agents in sequence:
+`myAI` is a local-first Mastra application. It uses Qwen 3.5 through an OpenAI-compatible LM Studio server, retrieves evidence from the verified e-commerce SDLC dataset, and runs two agents in sequence:
 
 1. **E-commerce Requirements Agent** — turns a project brief into structured, traceable requirements and decision factors.
 2. **E-commerce SDLC Recommendation Agent** — ranks lifecycle options and produces a project-specific workflow.
