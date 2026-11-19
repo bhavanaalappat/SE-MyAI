@@ -1,0 +1,1 @@
+{"version":1,"localPaths":[{"value":"file:./myai.db","hint":"LibSQL/SQLite file path relative to the build host","module":"/Users/bhavanaalappat/Downloads/myAI/src/mastra/index.ts","guardedBy":"MASTRA_DATABASE_URL"}],"userEnvRefs":["INIT_CWD","MASTRA_DATABASE_URL","MYAI_WORKSPACE_ROOT"]}
