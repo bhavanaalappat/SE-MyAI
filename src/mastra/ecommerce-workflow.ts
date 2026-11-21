@@ -7,6 +7,19 @@ import { workspaceRoot } from './workspace';
 
 const previewDir = join(workspaceRoot, 'artifacts/ecommerce-sdlc');
 
+// Size safeguards (characters; ~4 chars per token).
+const LIMITS = {
+  maxPromptChars: 6000, // user brief sent to the Requirements Agent
+  maxProfileChars: 7000, // requirements profile sent to the SDLC Agent
+  maxDocumentChars: 40000, // combined artifact written to disk
+} as const;
+
+const clip = (text: string, max: number, label: string) => {
+  if (text.length <= max) return text;
+  console.warn(`[workflow] ${label} was ${text.length} chars; clipped to ${max}.`);
+  return `${text.slice(0, max).trimEnd()}\n\n[${label} clipped to ${max} characters]`;
+};
+
 type UnknownRecord = Record<string, unknown>;
 
 const asRecord = (value: unknown): UnknownRecord | undefined =>
@@ -57,6 +70,12 @@ const textFromGenerateResult = (result: unknown): string => {
   return '';
 };
 
+const markIfTruncated = (result: unknown, text: string, label: string) => {
+  if (asRecord(result)?.finishReason !== 'length') return text;
+  console.warn(`[workflow] ${label} hit the output token limit and was cut off.`);
+  return `${text}\n\n> NOTE: ${label} output was cut off at the token limit. Treat it as incomplete.`;
+};
+
 const htmlPreview = (markdown: string) => `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"/><title>myAI E-commerce SDLC Recommendation</title><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/github-markdown-css/5.8.1/github-markdown.min.css"/><style>body{box-sizing:border-box;min-width:200px;max-width:1100px;margin:0 auto;padding:45px;}</style></head><body class="markdown-body"><pre style="white-space:pre-wrap">${markdown.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c] ?? c))}</pre></body></html>`;
 
 const profileRequirements = createStep({
@@ -65,10 +84,10 @@ const profileRequirements = createStep({
   inputSchema: z.object({ prompt: z.string() }),
   outputSchema: z.object({ requirements: z.string() }),
   execute: async ({ inputData }) => {
-    const result = await ecommerceRequirementsAgent.generate(inputData.prompt);
-    const requirements = textFromGenerateResult(result);
-    if (!requirements) throw new Error('E-commerce Requirements Agent returned no text');
-    return { requirements };
+    const result = await ecommerceRequirementsAgent.generate(clip(inputData.prompt, LIMITS.maxPromptChars, 'Project brief'));
+    const text = textFromGenerateResult(result);
+    if (!text) throw new Error('E-commerce Requirements Agent returned no text (check LM Studio is running and the model is loaded)');
+    return { requirements: markIfTruncated(result, text, 'Requirements profile') };
   },
 });
 
@@ -78,9 +97,12 @@ const recommendEcommerceSdlc = createStep({
   inputSchema: z.object({ requirements: z.string() }),
   outputSchema: z.object({ requirements: z.string(), sdlc: z.string(), document: z.string() }),
   execute: async ({ inputData }) => {
-    const result = await ecommerceSdlcSelectionAgent.generate(`Recommend an SDLC for this e-commerce requirements profile.\n\n${inputData.requirements}`);
-    const sdlc = textFromGenerateResult(result);
-    if (!sdlc) throw new Error('E-commerce SDLC Recommendation Agent returned no text');
+    // Only the concise requirements profile is passed on; the original brief is not repeated.
+    const profile = clip(inputData.requirements, LIMITS.maxProfileChars, 'Requirements profile');
+    const result = await ecommerceSdlcSelectionAgent.generate(`Recommend an SDLC for this requirements profile.\n\n${profile}`);
+    const text = textFromGenerateResult(result);
+    if (!text) throw new Error('E-commerce SDLC Recommendation Agent returned no text (check LM Studio is running and the model is loaded)');
+    const sdlc = markIfTruncated(result, text, 'SDLC recommendation');
     return { requirements: inputData.requirements, sdlc, document: `${inputData.requirements.trim()}\n\n---\n\n${sdlc.trim()}` };
   },
 });
@@ -92,10 +114,11 @@ const writeEcommercePreview = createStep({
   outputSchema: z.object({ requirements: z.string(), sdlc: z.string(), document: z.string(), markdownPath: z.string(), htmlPath: z.string() }),
   execute: async ({ inputData }) => {
     await mkdir(previewDir, { recursive: true });
+    const document = clip(inputData.document, LIMITS.maxDocumentChars, 'Document');
     const markdownPath = join(previewDir, 'latest.md');
     const htmlPath = join(previewDir, 'latest.html');
-    await writeFile(markdownPath, `${inputData.document.trim()}\n`, 'utf8');
-    await writeFile(htmlPath, htmlPreview(inputData.document), 'utf8');
+    await writeFile(markdownPath, `${document.trim()}\n`, 'utf8');
+    await writeFile(htmlPath, htmlPreview(document), 'utf8');
     return { ...inputData, markdownPath, htmlPath };
   },
 });

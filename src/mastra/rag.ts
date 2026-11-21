@@ -1,13 +1,29 @@
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { InputProcessorOrWorkflow, ProcessInputArgs, ProcessInputResult } from '@mastra/core/processors';
-import { ecommerceWorkspace } from './workspace';
-import { workspaceRoot } from './workspace';
+import { ecommerceWorkspace, workspaceRoot } from './workspace';
 
-const MAX_HIT_CHARS = 1200;
-const TOP_K = 6;
-const ECOMMERCE_QUERY = 'e-commerce commerce platform requirements payments checkout inventory fulfilment security privacy performance integrations release testing SDLC';
-const SDLC_QUERY = 'software development lifecycle planning implementation testing review release maintenance security documented public evidence';
+/** Retrieval budget. Worst case ≈ 3 excerpts × ~550 chars ≈ 450 tokens per agent call. */
+export const RETRIEVAL_LIMITS = {
+  topK: 2, // BM25 hits per search
+  maxQueryChars: 700, // BM25 query length (keeps long requirement profiles cheap)
+  maxExcerptChars: 500, // per evidence excerpt
+  maxFallbackChars: 1500, // fallback excerpt if BM25 fails
+  maxEvidenceItems: 3, // after de-duplication, per agent call
+} as const;
+
+// The only file used for retrieval. Do not index CSV or other corpus files.
+const CORPUS_FILE = 'ecommerce-software-sdlc.md';
+const CORPUS_PATH = join(workspaceRoot, 'docs/ingested/ecommerce', CORPUS_FILE);
+
+// One short domain query per agent (instead of three broad searches).
+const REQUIREMENTS_DOMAIN_QUERY = 'e-commerce checkout payments inventory fulfilment security privacy';
+const SDLC_DOMAIN_QUERY = 'software development lifecycle testing review release security';
+
+type Hit = { id: string; content: string; limit?: number };
+
+const URL_RE = /https?:\/\/[^\s)>\]]+/g;
+const flat = (text: string) => text.replace(/\s+/g, ' ').trim();
 
 const partText = (part: unknown): string => {
   if (typeof part === 'string') return part;
@@ -40,64 +56,131 @@ const queryFromMessages = (messages: Array<{ role?: string; content?: unknown }>
   return '';
 };
 
-export const retrieveEvidence = async (query: string) => {
-  const trimmed = query.trim();
-  if (trimmed.length < 8) return [];
-  const indexedHits = await ecommerceWorkspace.search(trimmed, { mode: 'bm25', topK: TOP_K });
-  if (indexedHits.length > 0) return indexedHits;
+const queryTerms = (query: string) => new Set(query.toLowerCase().match(/[a-z][a-z-]{3,}/g) ?? []);
 
-  // Fallback for local Mastra builds where the BM25 index is not persisted
-  // or glob indexing behaves differently across operating systems.
-  const corpusPath = join(workspaceRoot, 'docs/ingested/ecommerce/ecommerce-software-sdlc.md');
+/** Pick the paragraph that overlaps most with the query terms. */
+const bestParagraph = (content: string, wanted: Set<string>) => {
+  let text = '';
+  let score = -1;
+  for (const paragraph of content.split(/\n\s*\n/)) {
+    const lower = paragraph.toLowerCase();
+    let current = 0;
+    for (const term of wanted) if (lower.includes(term)) current += 1;
+    if (current > score) {
+      text = paragraph;
+      score = current;
+    }
+  }
+  return { text, score: Math.max(score, 0) };
+};
+
+let corpusCache: string | undefined;
+const loadCorpus = async () => {
+  if (corpusCache !== undefined) return corpusCache;
   try {
-    const content = await readFile(corpusPath, 'utf8');
-    return [{ id: 'ecommerce-software-sdlc.md', content }];
+    corpusCache = await readFile(CORPUS_PATH, 'utf8');
+    return corpusCache;
   } catch {
-    return [];
+    return '';
   }
 };
 
-const uniqueHits = (...lists: Array<Array<{ id: string; content: string }>>) => {
+/** Short, relevant excerpt only — never the whole corpus. */
+const fallbackEvidence = async (query: string): Promise<Hit[]> => {
+  const corpus = await loadCorpus();
+  if (!corpus) return [];
+  const { text, score } = bestParagraph(corpus, queryTerms(query));
+  if (!text || score === 0) return [];
+  return [{ id: CORPUS_FILE, content: text.slice(0, RETRIEVAL_LIMITS.maxFallbackChars), limit: RETRIEVAL_LIMITS.maxFallbackChars }];
+};
+
+export const retrieveEvidence = async (query: string): Promise<Hit[]> => {
+  const trimmed = flat(query).slice(0, RETRIEVAL_LIMITS.maxQueryChars);
+  if (trimmed.length < 8) return [];
+  try {
+    const hits = await ecommerceWorkspace.search(trimmed, { mode: 'bm25', topK: RETRIEVAL_LIMITS.topK });
+    const usable = hits
+      .filter((hit) => String(hit.id).includes(CORPUS_FILE))
+      .slice(0, RETRIEVAL_LIMITS.topK)
+      .map((hit) => ({ id: String(hit.id), content: String(hit.content ?? '') }))
+      .filter((hit) => hit.content.trim().length > 0);
+    if (usable.length > 0) return usable;
+  } catch (error) {
+    console.warn('[rag] BM25 search failed, using short fallback excerpt:', error instanceof Error ? error.message : error);
+  }
+  return fallbackEvidence(trimmed);
+};
+
+const mergeHits = (...lists: Hit[][]): Hit[] => {
   const seen = new Set<string>();
-  const merged: Array<{ id: string; content: string }> = [];
+  const merged: Hit[] = [];
   for (const list of lists) {
     for (const hit of list) {
-      if (seen.has(hit.id)) continue;
-      seen.add(hit.id);
+      // One corpus file means many hits share an id, so key on id + content start.
+      const key = `${hit.id}|${flat(hit.content).slice(0, 120)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
       merged.push(hit);
     }
   }
-  return merged.slice(0, 10);
+  return merged.slice(0, RETRIEVAL_LIMITS.maxEvidenceItems);
 };
 
-export const formatEvidence = (hits: Array<{ id: string; content: string }>) => {
+const excerpt = (hit: Hit, wanted: Set<string>) => {
+  const max = hit.limit ?? RETRIEVAL_LIMITS.maxExcerptChars;
+  const { text } = bestParagraph(hit.content, wanted);
+  let out = flat(text || hit.content).slice(0, max);
+  // Keep a source URL available for citation even if the excerpt was cut.
+  const before = hit.content.slice(0, Math.max(0, hit.content.indexOf(text)));
+  const url = text.match(URL_RE)?.[0] ?? before.match(URL_RE)?.pop();
+  if (url && !out.includes(url)) out += ` [URL: ${url}]`;
+  return out;
+};
+
+export const formatEvidence = (hits: Hit[], focus = '') => {
   if (hits.length === 0) {
-    return ['Retrieved evidence: none.', 'Mark claims about existing software, vendors, legal requirements, payment controls, and numeric thresholds NEEDS-VALIDATION.', 'Do not invent citations.'].join('\n');
+    return 'Retrieved evidence: none. Mark claims about existing software, vendors, legal/payment rules, and numeric thresholds NEEDS-VALIDATION. Do not invent citations.';
   }
+  const wanted = queryTerms(focus);
   return [
-    'Retrieved evidence from docs/ingested/ecommerce. Use it only as comparative evidence and cite the source IDs and URLs included in the corpus.',
-    ...hits.map((hit, index) => `[${index + 1}] ${hit.id}\n${hit.content.replace(/\s+/g, ' ').trim().slice(0, MAX_HIT_CHARS)}`),
-  ].join('\n\n');
+    'Retrieved evidence (comparative only; cite source ID and URL):',
+    ...hits.map((hit, index) => `[${index + 1}] ${hit.id}: ${excerpt(hit, wanted)}`),
+  ].join('\n');
 };
 
-export const ragContextProcessor = {
-  id: 'ecommerce-rag-context-processor',
-  name: 'E-commerce Evidence Retrieval',
-  async processInput({ messages, systemMessages }: ProcessInputArgs): Promise<ProcessInputResult> {
-    const query = queryFromMessages(messages);
-    if (!query) return { messages, systemMessages };
-    const evidence = formatEvidence(uniqueHits(
-      await retrieveEvidence(query),
-      await retrieveEvidence(ECOMMERCE_QUERY),
-      await retrieveEvidence(SDLC_QUERY),
-    ));
-    const systemContent = systemMessages.map((message) => messageText(message)).filter(Boolean).join('\n\n');
-    return {
-      messages,
-      systemMessages: [{ role: 'system', content: [systemContent, evidence].filter(Boolean).join('\n\n') }],
-    };
-  },
-} as InputProcessorOrWorkflow;
+const createRagProcessor = (id: string, name: string, domainQuery: string) =>
+  ({
+    id,
+    name,
+    async processInput({ messages, systemMessages }: ProcessInputArgs): Promise<ProcessInputResult> {
+      const query = queryFromMessages(messages);
+      if (!query) return { messages, systemMessages };
+      const [primary, domain] = await Promise.all([retrieveEvidence(query), retrieveEvidence(domainQuery)]);
+      const evidence = formatEvidence(mergeHits(primary, domain), `${query.slice(0, RETRIEVAL_LIMITS.maxQueryChars)} ${domainQuery}`);
+      const systemContent = systemMessages.map((message) => messageText(message)).filter(Boolean).join('\n\n');
+      return {
+        messages,
+        systemMessages: [{ role: 'system', content: [systemContent, evidence].filter(Boolean).join('\n\n') }],
+      };
+    },
+  }) as InputProcessorOrWorkflow;
+
+/** Requirements agent: user brief + one e-commerce domain query. */
+export const requirementsRagProcessor = createRagProcessor(
+  'ecommerce-requirements-rag-processor',
+  'E-commerce Requirements Evidence Retrieval',
+  REQUIREMENTS_DOMAIN_QUERY,
+);
+
+/** SDLC agent: requirements profile + one SDLC query. */
+export const sdlcRagProcessor = createRagProcessor(
+  'ecommerce-sdlc-rag-processor',
+  'E-commerce SDLC Evidence Retrieval',
+  SDLC_DOMAIN_QUERY,
+);
+
+/** Backwards-compatible alias for any other file that still imports the old name. */
+export const ragContextProcessor = requirementsRagProcessor;
 
 export const assertCorpusSearchable = async () => {
   const hits = await retrieveEvidence('e-commerce software SDLC testing security release');
